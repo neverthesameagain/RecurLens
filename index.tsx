@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
-import { GoogleGenAI, Modality } from "@google/genai";
+import { GoogleGenAI, Modality, Type, Schema } from "@google/genai";
 import { 
   Brain, 
   Eye, 
@@ -33,27 +33,103 @@ import {
   Terminal as TerminalIcon,
   Search,
   ImageIcon,
-  Bug
+  Bug,
+  RotateCcw
 } from 'lucide-react';
+
+// --- SCHEMAS (STRICT JSON ENFORCEMENT) ---
+
+const AUDIO_SCHEMA: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    transcript: { type: Type.STRING },
+    tone: { type: Type.STRING },
+    urgency: { type: Type.STRING, enum: ["LOW", "MEDIUM", "HIGH"] }
+  },
+  required: ["transcript", "tone", "urgency"]
+};
+
+const VISION_SCHEMA: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    captions: { type: Type.ARRAY, items: { type: Type.STRING } },
+    objects: { type: Type.ARRAY, items: { type: Type.STRING } },
+    spatial_relations: { type: Type.STRING },
+    ambiguities: { type: Type.ARRAY, items: { type: Type.STRING } },
+    scene_summary: { type: Type.STRING }
+  },
+  required: ["captions", "objects", "scene_summary"]
+};
+
+const META_PROMPT_SCHEMA: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    task_type: { type: Type.STRING, enum: ["Troubleshooting", "Creative", "Planning", "Knowledge", "Analysis"] },
+    perceived_intent: { type: Type.STRING },
+    user_sentiment: {
+      type: Type.OBJECT,
+      properties: {
+        tone: { type: Type.STRING },
+        urgency: { type: Type.STRING, enum: ["LOW", "MEDIUM", "HIGH"] }
+      }
+    },
+    visual_anchors: { type: Type.ARRAY, items: { type: Type.STRING } },
+    constraints: { type: Type.ARRAY, items: { type: Type.STRING } },
+    missing_information: { type: Type.ARRAY, items: { type: Type.STRING } },
+    risk_analysis: {
+      type: Type.OBJECT,
+      properties: {
+        level: { type: Type.STRING, enum: ["LOW", "MEDIUM", "HIGH"] },
+        mitigation: { type: Type.STRING }
+      }
+    },
+    required_tools: { type: Type.ARRAY, items: { type: Type.STRING } },
+    plan_of_attack: { type: Type.ARRAY, items: { type: Type.STRING } },
+    draft_prompt: { type: Type.STRING }
+  },
+  required: ["task_type", "perceived_intent", "draft_prompt", "plan_of_attack", "constraints"]
+};
+
+const CRITIC_SCHEMA: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    scores: {
+      type: Type.OBJECT,
+      properties: {
+        clarity: { type: Type.NUMBER },
+        completeness: { type: Type.NUMBER },
+        grounding: { type: Type.NUMBER },
+        constraints: { type: Type.NUMBER },
+        safety: { type: Type.NUMBER },
+        logic: { type: Type.NUMBER },
+        ambiguity: { type: Type.NUMBER },
+        actionability: { type: Type.NUMBER }
+      },
+      required: ["clarity", "completeness", "grounding", "constraints", "safety", "logic", "ambiguity", "actionability"]
+    },
+    weighted_final_score: { type: Type.NUMBER },
+    critique_text: { type: Type.STRING },
+    convergence_decision: { type: Type.STRING, enum: ["CONTINUE", "STOP"] },
+    needs_user_clarification: { type: Type.BOOLEAN },
+    clarification_question: { type: Type.STRING }
+  },
+  required: ["scores", "weighted_final_score", "critique_text", "convergence_decision", "needs_user_clarification"]
+};
+
 
 // --- UTILITIES ---
 
 const cleanJson = (text: string) => {
   if (!text) return "{}";
   let clean = text.trim();
-  // Remove markdown code blocks if present
   clean = clean.replace(/```json/g, '').replace(/```/g, '');
-  // Attempt to find the first '{' and last '}' to extract valid JSON if there is extra text
   const firstBrace = clean.indexOf('{');
   const lastBrace = clean.lastIndexOf('}');
   
   if (firstBrace !== -1 && lastBrace !== -1) {
     return clean.substring(firstBrace, lastBrace + 1);
   }
-  
-  // If no braces found, log warning and return empty object to prevent crash
-  console.warn("CleanJson: No braces found in text:", text);
-  return "{}";
+  return text; // Return original if no braces found (might be raw JSON from schema mode)
 };
 
 const calculateCosineSimilarity = (str1: string, str2: string) => {
@@ -213,20 +289,10 @@ interface AudioAnalysis {
 const PROMPTS = {
   VISION_MODULE: `
     Analyze this image for a recursive reasoning engine. 
-    Output JSON with:
-    - captions: Detailed descriptive captions.
-    - objects: List of key detected objects with location hints (e.g., "red cup (foreground)").
-    - spatial_relations: Precise relative positioning (e.g., "X is immediately to the left of Y").
-    - ambiguities: Visual elements that are unclear, blurry, or could be interpreted in multiple ways.
-    - scene_summary: A concise holistic summary including lighting and context.
+    Focus on elements that might be relevant to user tasks (tools, environments, people, text).
   `,
   AUDIO_MODULE: `
-    Analyze this audio. Return JSON:
-    {
-      "transcript": "Exact words spoken",
-      "tone": "e.g., Frustrated, Curious, Urgent, Calm",
-      "urgency": "LOW" | "MEDIUM" | "HIGH"
-    }
+    Analyze this audio. Identify the transcript, the emotional tone, and the urgency level.
   `,
   INITIALIZER: (audioCtx: AudioAnalysis, vision: VisionAnalysis) => `
     ROLE: RecurLens Initializer (V2).
@@ -238,15 +304,11 @@ const PROMPTS = {
     - Vision Context: ${JSON.stringify(vision)}
 
     INSTRUCTIONS:
-    Construct the initial Meta-Prompt JSON.
-    1. Analyze the 'perceived_intent' considering the emotional tone.
-    2. 'user_sentiment': Store the input tone and urgency.
-    3. 'draft_prompt': Write an EXPERT-LEVEL prompt. If urgency is HIGH, prioritize directness.
-    4. 'visual_anchors': Extract specific visual details.
-    5. 'risk_analysis': Assess potential for harm.
-    6. 'plan_of_attack': Reasoning plan.
-    7. 'clarification_history': Initialize as empty array [].
-    8. 'required_tools': Add "googleSearch" if external knowledge is needed.
+    Construct the initial Meta-Prompt JSON based on the schema.
+    1. Analyze the 'perceived_intent'.
+    2. 'draft_prompt': Write an EXPERT-LEVEL prompt acting as an agent.
+    3. 'risk_analysis': Assess potential for harm.
+    4. 'plan_of_attack': Reasoning plan step-by-step.
   `,
   CRITIC: (currentMeta: MetaPromptState, transcript: string, vision: VisionAnalysis) => `
     ROLE: RecurLens Meta-Critic (V2).
@@ -257,20 +319,15 @@ const PROMPTS = {
     - Original Transcript: "${transcript}"
     - Vision Context: ${JSON.stringify(vision)}
 
-    SCORING FORMULA:
-    Score = (0.20*Clarity) + (0.15*Completeness) + (0.15*Grounding) + (0.15*Constraints) + (0.10*Safety) + (0.10*Logic) + (0.10*Ambiguity) + (0.05*Actionability)
-
     INSTRUCTIONS:
-    - Calculate Weighted Score.
-    - If Ambiguity > 0.7 OR critical info is missing that cannot be inferred/searched:
-      - Set 'needs_user_clarification' to TRUE.
-      - Write a concise 'clarification_question' for the user.
-    - Else set 'needs_user_clarification' to FALSE.
-    - If Weighted Score > 0.85 AND !needs_user_clarification, set convergence_decision to "STOP".
+    - Critically evaluate the 'draft_prompt'. Is it too vague? Does it miss the user's intent?
+    - Calculate scores (0.0 to 1.0).
+    - If Ambiguity > 0.7 OR critical info is missing: Set 'needs_user_clarification' to TRUE.
+    - If Weighted Score > 0.85 AND !needs_user_clarification, set convergence_decision to "STOP". Otherwise "CONTINUE".
   `,
   REFINER: (currentMeta: MetaPromptState, critic: CriticOutput, history: any[]) => `
     ROLE: RecurLens Refiner (V2).
-    TASK: Optimize the Meta-Prompt.
+    TASK: Optimize the Meta-Prompt based on critique.
 
     INPUTS:
     - Previous State: ${JSON.stringify(currentMeta)}
@@ -278,12 +335,9 @@ const PROMPTS = {
     - Clarification History: ${JSON.stringify(currentMeta.clarification_history)}
     
     INSTRUCTIONS:
-    - If 'clarification_history' has new items, INTEGRATE that new knowledge into 'draft_prompt' and 'constraints'.
-    - Address 'critique_text' explicitly.
-    - OPTIMIZATION MODE:
-       - Low Clarity -> COMPRESS (Simplify).
-       - Low Completeness -> EXPAND (Add details).
-    - Increment metadata.iteration.
+    - Rewrite 'draft_prompt' to address the 'critique_text'.
+    - Update 'constraints' and 'plan_of_attack'.
+    - Keep the same 'task_type' and 'user_sentiment'.
   `,
   EXECUTOR: (finalMeta: MetaPromptState) => `
     ROLE: RecurLens Executor.
@@ -294,13 +348,11 @@ const PROMPTS = {
     CONSTRAINTS: ${JSON.stringify(finalMeta.constraints)}
     VISUAL CONTEXT: ${JSON.stringify(finalMeta.visual_anchors)}
     RISK LEVEL: ${finalMeta.risk_analysis.level}
-    USER SENTIMENT: ${JSON.stringify(finalMeta.user_sentiment)}
 
     INSTRUCTIONS:
+    - Execute the FINAL PROMPT.
     - Follow the Plan of Attack.
     - Adhere strictly to Constraints.
-    - If tools (Search) are enabled, integrate findings.
-    - MATCH THE USER'S TONE: If they are frustrated, be efficient and reassuring. If curious, be detailed.
     - Provide the final, high-quality solution.
   `
 };
@@ -310,7 +362,6 @@ const PROMPTS = {
 const getPythonCode = (currentInput: string) => {
   return `
 import os
-import time
 import json
 from google import genai
 from google.genai import types
@@ -320,20 +371,8 @@ API_KEY = os.environ.get("API_KEY", "YOUR_API_KEY_HERE")
 client = genai.Client(api_key=API_KEY)
 MODEL_NAME = "gemini-2.5-flash"
 
-# --- PROMPTS ---
-PROMPTS = {
-    "INITIALIZER": """${PROMPTS.INITIALIZER({transcript: "{input}", tone: "Neutral", urgency: "LOW"}, {captions:[], objects:[], spatial_relations:"", ambiguities:[], scene_summary:"No image"} as any).replace(/\n/g, '\\n')}""",
-    "CRITIC": """${PROMPTS.CRITIC({} as any, "{input}", {} as any).replace(/\n/g, '\\n')}""",
-    "REFINER": """${PROMPTS.REFINER({} as any, {} as any, []).replace(/\n/g, '\\n')}""",
-    "EXECUTOR": """${PROMPTS.EXECUTOR({ draft_prompt: "...", plan_of_attack: [], constraints: [], visual_anchors: [], risk_analysis: {level: "LOW"}, user_sentiment: {tone: "Neutral", urgency: "LOW"} } as any).replace(/\n/g, '\\n')}"""
-}
-
-def clean_json(text):
-    return text.strip().replace('\`\`\`json', '').replace('\`\`\`', '')
-
-def recur_lens_pipeline(user_input, image_path=None):
-    print(f"\\n🔵 STARTING RECURLENS FOR: '{user_input}'")
-    # ... (Full python logic placeholder) ...
+# You would implement the loop here using client.models.generate_content
+# and passing the schemas defined in the TypeScript code as 'response_schema'.
 `;
 };
 
@@ -459,7 +498,10 @@ const RecurLensApp = () => {
             { text: PROMPTS.AUDIO_MODULE }
           ]
         },
-        config: { responseMimeType: "application/json" }
+        config: { 
+            responseMimeType: "application/json",
+            responseSchema: AUDIO_SCHEMA 
+        }
       });
 
       const analysis: AudioAnalysis = JSON.parse(cleanJson(resp.text || "{}"));
@@ -561,6 +603,16 @@ const RecurLensApp = () => {
 
   // --- CORE RECURSION LOGIC ---
   
+  // Safe JSON Parse wrapper
+  const safeParse = <T,>(jsonStr: string, fallback: T): T => {
+      try {
+          return JSON.parse(jsonStr);
+      } catch (e) {
+          console.error("JSON Parse Error", e);
+          return fallback;
+      }
+  }
+
   const stepRecursion = async (startState: MetaPromptState, history: MetaPromptState[]) => {
     let currentMeta = startState;
     let localHistory = [...history];
@@ -574,33 +626,60 @@ const RecurLensApp = () => {
         depth++;
         setRecursionDepth(depth);
 
-        // A. CRITIC
+        // A. CRITIC (with Retry)
         addLog("system", `Running Meta-Critic (Cycle ${depth})...`);
-        const criticResp = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: PROMPTS.CRITIC(currentMeta, originalTranscriptRef.current, visionDataRef.current!),
-          config: { responseMimeType: "application/json" }
-        });
         
-        const rawCritic = criticResp.text || "{}";
-        addLog("debug", `[CRITIC RAW]: ${rawCritic}`);
+        let criticOutput: CriticOutput | null = null;
+        let retryCount = 0;
         
-        const criticText = cleanJson(rawCritic);
-        let criticOutput: CriticOutput;
-        try {
-            criticOutput = JSON.parse(criticText);
-        } catch(e) {
-            console.error("Critic Parse Error:", e);
-            throw new Error("Meta-Critic returned invalid JSON. Raw output logged.");
+        while (!criticOutput && retryCount < 2) {
+            try {
+                const criticResp = await ai.models.generateContent({
+                  model: 'gemini-2.5-flash',
+                  contents: PROMPTS.CRITIC(currentMeta, originalTranscriptRef.current, visionDataRef.current!),
+                  config: { 
+                      responseMimeType: "application/json",
+                      responseSchema: CRITIC_SCHEMA
+                  }
+                });
+                
+                const rawCritic = criticResp.text || "{}";
+                addLog("debug", `[CRITIC RAW ${retryCount}]: ${rawCritic}`);
+                
+                const parsed = safeParse(rawCritic, null);
+                if (parsed && parsed.scores) {
+                    criticOutput = parsed; // Valid
+                } else {
+                    throw new Error("Missing scores in critic output");
+                }
+            } catch (e) {
+                console.warn(`Critic failed attempt ${retryCount}:`, e);
+                retryCount++;
+                if (retryCount === 2) {
+                     addLog("error", "Critic failed multiple times. Using fallback.");
+                     // Fallback Critic
+                     criticOutput = {
+                         scores: { clarity: 0.5, completeness: 0.5, grounding: 0.5, constraints: 0.5, safety: 1, logic: 0.5, ambiguity: 0.1, actionability: 0.5 },
+                         weighted_final_score: 0.5,
+                         critique_text: "System could not generate specific critique. Proceeding with general refinement.",
+                         convergence_decision: "CONTINUE",
+                         needs_user_clarification: false,
+                         clarification_question: "",
+                         hallucination_check: "Unknown",
+                         grounding_alignment_check: "Unknown"
+                     };
+                }
+            }
         }
         
-        setCriticState(criticOutput);
-        addLog("critic", criticOutput);
+        // At this point criticOutput is definitely not null (due to fallback)
+        setCriticState(criticOutput!);
+        addLog("critic", criticOutput!);
 
         // --- INTERRUPTION CHECK: CLARIFICATION ---
-        if (criticOutput?.needs_user_clarification) {
+        if (criticOutput!.needs_user_clarification) {
           addLog("system", "⚠️ Ambiguity Detected. Pausing for user clarification.");
-          setClarificationQuestion(criticOutput.clarification_question || "Please clarify your request.");
+          setClarificationQuestion(criticOutput!.clarification_question || "Please clarify your request.");
           setIsWaitingForClarification(true);
           setCurrentState(currentMeta); 
           setRecursionHistory(localHistory);
@@ -615,9 +694,12 @@ const RecurLensApp = () => {
            addLog("system", `Drift/Similarity Check: ${(similarity * 100).toFixed(1)}%`);
         }
 
+        // Robust check: Ensure weighted_final_score exists and is a number
+        const score = criticOutput!.weighted_final_score || 0;
+
         if (
-          criticOutput?.convergence_decision === "STOP" || 
-          (criticOutput?.weighted_final_score && criticOutput.weighted_final_score > 0.88) ||
+          criticOutput!.convergence_decision === "STOP" || 
+          score > 0.88 ||
           (depth > 1 && similarity > 0.98)
         ) {
           addLog("system", "Convergence Threshold Met. Executing...");
@@ -633,21 +715,17 @@ const RecurLensApp = () => {
         
         const refineResp = await ai.models.generateContent({
           model: 'gemini-2.5-flash',
-          contents: PROMPTS.REFINER(currentMeta, criticOutput, localHistory),
-          config: { responseMimeType: "application/json" }
+          contents: PROMPTS.REFINER(currentMeta, criticOutput!, localHistory),
+          config: { 
+              responseMimeType: "application/json",
+              responseSchema: META_PROMPT_SCHEMA
+          }
         });
 
         const rawRefiner = refineResp.text || "{}";
         addLog("debug", `[REFINER RAW]: ${rawRefiner}`);
 
-        const refineText = cleanJson(rawRefiner);
-        let nextMeta: MetaPromptState;
-        try {
-            nextMeta = JSON.parse(refineText);
-        } catch (e) {
-             console.error("Refiner Parse Error:", e);
-             throw new Error("Refiner returned invalid JSON. Raw output logged.");
-        }
+        let nextMeta: MetaPromptState = safeParse(rawRefiner, currentMeta); // Fallback to current if parse fails
         
         // Ensure critical fields exist to prevent partial updates
         nextMeta.metadata = { iteration: depth, timestamp: new Date().toISOString() };
@@ -664,7 +742,7 @@ const RecurLensApp = () => {
       } catch (err) {
         console.error("Recursion Step Error:", err);
         addLog("error", `Recursion Error at Depth ${depth}. Forcing execution to prevent hang. Error: ${(err as Error).message}`);
-        // Fallback: If recursion fails (e.g. malformed JSON from LLM), stop and execute what we have.
+        // Fallback: If recursion fails hard, stop and execute what we have.
         setRecursionHistory(localHistory);
         await executeFinal(currentMeta);
         return;
@@ -813,7 +891,10 @@ const RecurLensApp = () => {
               { text: PROMPTS.VISION_MODULE }
             ]
           },
-          config: { responseMimeType: "application/json" }
+          config: { 
+              responseMimeType: "application/json",
+              responseSchema: VISION_SCHEMA
+          }
         });
         const rawVision = visionResp.text || "{}";
         addLog("debug", `[VISION RAW]: ${rawVision}`);
@@ -829,7 +910,10 @@ const RecurLensApp = () => {
       const initResp = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
         contents: PROMPTS.INITIALIZER(audioCtx, visionData),
-        config: { responseMimeType: "application/json" }
+        config: { 
+            responseMimeType: "application/json",
+            responseSchema: META_PROMPT_SCHEMA
+        }
       });
       
       const rawInit = initResp.text || "{}";
