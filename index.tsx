@@ -34,10 +34,14 @@ import {
   Search,
   ImageIcon,
   Bug,
-  RotateCcw
+  RotateCcw,
+  AlertTriangle,
+  Scan,
+  Network,
+  Anchor
 } from 'lucide-react';
 
-// --- SCHEMAS (STRICT JSON ENFORCEMENT) ---
+// --- V3 RESEARCH SCHEMAS ---
 
 const AUDIO_SCHEMA: Schema = {
   type: Type.OBJECT,
@@ -52,19 +56,49 @@ const AUDIO_SCHEMA: Schema = {
 const VISION_SCHEMA: Schema = {
   type: Type.OBJECT,
   properties: {
-    captions: { type: Type.ARRAY, items: { type: Type.STRING } },
-    objects: { type: Type.ARRAY, items: { type: Type.STRING } },
-    spatial_relations: { type: Type.STRING },
-    ambiguities: { type: Type.ARRAY, items: { type: Type.STRING } },
-    scene_summary: { type: Type.STRING }
+    scene_summary: { type: Type.STRING },
+    regions: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          id: { type: Type.STRING, description: "e.g., 'R1', 'R2'" },
+          description: { type: Type.STRING },
+          saliency: { type: Type.NUMBER, description: "0.0 to 1.0 importance" },
+          ambiguity: { type: Type.NUMBER, description: "0.0 to 1.0 uncertainty" }
+        },
+        required: ["id", "description", "saliency", "ambiguity"]
+      }
+    },
+    objects: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          name: { type: Type.STRING },
+          location_hint: { type: Type.STRING },
+          region_id: { type: Type.STRING, description: "Reference to regions list" }
+        },
+        required: ["name", "location_hint"]
+      }
+    },
+    spatial_relations: { type: Type.STRING }
   },
-  required: ["captions", "objects", "scene_summary"]
+  required: ["scene_summary", "regions", "objects", "spatial_relations"]
 };
 
 const META_PROMPT_SCHEMA: Schema = {
   type: Type.OBJECT,
   properties: {
+    metadata: {
+       type: Type.OBJECT,
+       properties: {
+         iteration: { type: Type.INTEGER },
+         timestamp: { type: Type.STRING }
+       }
+    },
     task_type: { type: Type.STRING, enum: ["Troubleshooting", "Creative", "Planning", "Knowledge", "Analysis"] },
+    refinement_strategy: { type: Type.STRING, enum: ["INITIAL", "EXPAND", "COMPRESS", "CORRECT", "COMPLETE", "LOCALIZE", "UNCERTAINTY", "REGROUND"] },
     perceived_intent: { type: Type.STRING },
     user_sentiment: {
       type: Type.OBJECT,
@@ -74,8 +108,23 @@ const META_PROMPT_SCHEMA: Schema = {
       }
     },
     visual_anchors: { type: Type.ARRAY, items: { type: Type.STRING } },
-    constraints: { type: Type.ARRAY, items: { type: Type.STRING } },
+    
+    // V3: Structured Constraints Lattice
+    constraints: { 
+      type: Type.ARRAY, 
+      items: { 
+        type: Type.OBJECT,
+        properties: {
+           id: { type: Type.STRING },
+           type: { type: Type.STRING, enum: ["HARD", "SOFT"] },
+           description: { type: Type.STRING }
+        },
+        required: ["id", "type", "description"]
+      } 
+    },
+    
     missing_information: { type: Type.ARRAY, items: { type: Type.STRING } },
+    
     risk_analysis: {
       type: Type.OBJECT,
       properties: {
@@ -83,11 +132,27 @@ const META_PROMPT_SCHEMA: Schema = {
         mitigation: { type: Type.STRING }
       }
     },
+    
     required_tools: { type: Type.ARRAY, items: { type: Type.STRING } },
-    plan_of_attack: { type: Type.ARRAY, items: { type: Type.STRING } },
+    
+    // V3: DAG Plan
+    plan_of_attack: { 
+      type: Type.ARRAY, 
+      items: { 
+        type: Type.OBJECT,
+        properties: {
+          step_id: { type: Type.STRING },
+          action: { type: Type.STRING },
+          logic_type: { type: Type.STRING, enum: ["SEQUENTIAL", "CONDITIONAL", "LOOP"] },
+          dependencies: { type: Type.ARRAY, items: { type: Type.STRING } }
+        },
+        required: ["step_id", "action", "logic_type"]
+      } 
+    },
+    
     draft_prompt: { type: Type.STRING }
   },
-  required: ["task_type", "perceived_intent", "draft_prompt", "plan_of_attack", "constraints"]
+  required: ["task_type", "refinement_strategy", "perceived_intent", "draft_prompt", "plan_of_attack", "constraints", "risk_analysis"]
 };
 
 const CRITIC_SCHEMA: Schema = {
@@ -129,7 +194,7 @@ const cleanJson = (text: string) => {
   if (firstBrace !== -1 && lastBrace !== -1) {
     return clean.substring(firstBrace, lastBrace + 1);
   }
-  return text; // Return original if no braces found (might be raw JSON from schema mode)
+  return text; 
 };
 
 const calculateCosineSimilarity = (str1: string, str2: string) => {
@@ -162,7 +227,6 @@ const blobToBase64 = (blob: Blob): Promise<string> => {
   });
 };
 
-// AUDIO DECODING FOR TTS (PCM 24kHz)
 function decodeBase64(base64: string) {
   const binaryString = atob(base64);
   const len = binaryString.length;
@@ -215,20 +279,47 @@ const SCENARIOS = [
   }
 ];
 
-// --- SYSTEM ARCHITECTURE & TYPES ---
+// --- SYSTEM TYPES ---
+
+interface VisionRegion {
+    id: string;
+    description: string;
+    saliency: number;
+    ambiguity: number;
+}
+
+interface VisionObject {
+    name: string;
+    location_hint: string;
+    region_id?: string;
+}
+
+interface MetaConstraint {
+    id: string;
+    type: "HARD" | "SOFT";
+    description: string;
+}
+
+interface MetaPlanStep {
+    step_id: string;
+    action: string;
+    logic_type: "SEQUENTIAL" | "CONDITIONAL" | "LOOP";
+    dependencies?: string[];
+}
 
 interface MetaPromptState {
   task_type: "Troubleshooting" | "Creative" | "Planning" | "Knowledge" | "Analysis";
+  refinement_strategy: "INITIAL" | "EXPAND" | "COMPRESS" | "CORRECT" | "COMPLETE" | "LOCALIZE" | "UNCERTAINTY" | "REGROUND";
   perceived_intent: string;
   user_sentiment: {
     tone: string;
     urgency: "LOW" | "MEDIUM" | "HIGH";
   };
-  input_modalities_used: string[];
+  input_modalities_used?: string[];
   visual_anchors: string[];
-  temporal_context: string;
-  constraints: string[];
-  assumptions: string[];
+  temporal_context?: string;
+  
+  constraints: MetaConstraint[]; // V3 Structured
   missing_information: string[];
   clarification_history: { question: string, answer: string }[];
   risk_analysis: {
@@ -236,14 +327,11 @@ interface MetaPromptState {
     mitigation: string;
   };
   required_tools: string[];
-  plan_of_attack: string[];
-  evaluation_criteria: string[];
-  expected_output_format: string;
+  plan_of_attack: MetaPlanStep[]; // V3 Structured DAG
+  
+  evaluation_criteria?: string[];
+  expected_output_format?: string;
   draft_prompt: string;
-  confidence_scores: {
-    understanding: number;
-    feasibility: number;
-  };
   metadata: {
     iteration: number;
     timestamp: string;
@@ -266,15 +354,15 @@ interface CriticOutput {
   convergence_decision: "CONTINUE" | "STOP";
   needs_user_clarification: boolean;
   clarification_question: string;
-  hallucination_check: string;
-  grounding_alignment_check: string;
+  hallucination_check?: string;
+  grounding_alignment_check?: string;
 }
 
 interface VisionAnalysis {
   captions: string[];
-  objects: string[];
+  regions: VisionRegion[];
+  objects: VisionObject[];
   spatial_relations: string;
-  ambiguities: string[];
   scene_summary: string;
 }
 
@@ -284,76 +372,84 @@ interface AudioAnalysis {
   urgency: "LOW" | "MEDIUM" | "HIGH";
 }
 
-// --- PROMPTS ---
+// --- V3 PROMPTS ---
 
 const PROMPTS = {
   VISION_MODULE: `
-    Analyze this image for a recursive reasoning engine. 
-    Focus on elements that might be relevant to user tasks (tools, environments, people, text).
+    Analyze this image for the RecurLens V3 Grounding Engine.
+    1. Identify distinct 'regions' (e.g. top-left, center-mass). Assign a 'saliency' (0-1) and 'ambiguity' (0-1) score to each.
+    2. Extract objects and map them to regions.
+    3. Describe spatial relations precisely.
   `,
   AUDIO_MODULE: `
     Analyze this audio. Identify the transcript, the emotional tone, and the urgency level.
   `,
   INITIALIZER: (audioCtx: AudioAnalysis, vision: VisionAnalysis) => `
-    ROLE: RecurLens Initializer (V2).
-    TASK: Convert raw inputs into a structured Meta-Prompt State.
+    ROLE: RecurLens V3 Initializer.
+    TASK: Convert raw multimodal inputs into a structured Meta-Prompt Graph.
     
     INPUTS:
     - Transcript: "${audioCtx.transcript}"
-    - Tone/Emotion: "${audioCtx.tone}" (Urgency: ${audioCtx.urgency})
-    - Vision Context: ${JSON.stringify(vision)}
+    - Tone: "${audioCtx.tone}"
+    - Vision: ${JSON.stringify(vision.regions.length > 0 ? vision.regions : "No visual context")}
 
     INSTRUCTIONS:
-    Construct the initial Meta-Prompt JSON based on the schema.
-    1. Analyze the 'perceived_intent'.
-    2. 'draft_prompt': Write an EXPERT-LEVEL prompt acting as an agent.
-    3. 'risk_analysis': Assess potential for harm.
-    4. 'plan_of_attack': Reasoning plan step-by-step.
+    1. 'refinement_strategy': Set to "INITIAL".
+    2. 'constraints': Define HARD and SOFT constraints as objects.
+    3. 'plan_of_attack': Create a logical DAG of steps (SEQUENTIAL/CONDITIONAL).
+    4. 'draft_prompt': Write the expert agent prompt.
+    5. 'risk_analysis': If High Risk, define mitigation.
   `,
   CRITIC: (currentMeta: MetaPromptState, transcript: string, vision: VisionAnalysis) => `
-    ROLE: RecurLens Meta-Critic (V2).
-    TASK: Evaluate the Meta-Prompt against inputs.
+    ROLE: RecurLens V3 Meta-Critic.
+    TASK: Evaluate the Meta-Prompt Graph.
 
     INPUTS:
-    - Current Meta-Prompt: ${JSON.stringify(currentMeta)}
+    - Current State: ${JSON.stringify(currentMeta)}
     - Original Transcript: "${transcript}"
-    - Vision Context: ${JSON.stringify(vision)}
+    - Vision Evidence: ${JSON.stringify(vision.regions)}
 
     INSTRUCTIONS:
-    - Critically evaluate the 'draft_prompt'. Is it too vague? Does it miss the user's intent?
-    - Calculate scores (0.0 to 1.0).
-    - If Ambiguity > 0.7 OR critical info is missing: Set 'needs_user_clarification' to TRUE.
-    - If Weighted Score > 0.85 AND !needs_user_clarification, set convergence_decision to "STOP". Otherwise "CONTINUE".
+    - Score rigorously (0.0 - 1.0).
+    - Check 'constraints' coverage.
+    - Check 'plan_of_attack' logic holes.
+    - If vision is ignored but required, penalize 'grounding'.
+    - If score > 0.92, STOP.
   `,
   REFINER: (currentMeta: MetaPromptState, critic: CriticOutput, history: any[]) => `
-    ROLE: RecurLens Refiner (V2).
-    TASK: Optimize the Meta-Prompt based on critique.
+    ROLE: RecurLens V3 Refiner.
+    TASK: Evolve the Meta-Prompt Graph.
 
     INPUTS:
     - Previous State: ${JSON.stringify(currentMeta)}
-    - Critic Feedback: ${JSON.stringify(critic)}
-    - Clarification History: ${JSON.stringify(currentMeta.clarification_history)}
+    - Critique: ${JSON.stringify(critic)}
+    
+    STRATEGY SELECTION:
+    - UNCERTAINTY: If ambiguity > 0.4.
+    - REGROUND: If grounding < 0.6 (Link specific Vision Regions).
+    - CORRECT: If safety/logic < 0.7.
+    - EXPAND: If completeness < 0.7.
+    - COMPRESS: If clarity < 0.6.
     
     INSTRUCTIONS:
-    - Rewrite 'draft_prompt' to address the 'critique_text'.
-    - Update 'constraints' and 'plan_of_attack'.
-    - Keep the same 'task_type' and 'user_sentiment'.
+    - Apply the selected strategy to 'draft_prompt'.
+    - Mutate 'plan_of_attack' and 'constraints' to match new logic.
   `,
   EXECUTOR: (finalMeta: MetaPromptState) => `
-    ROLE: RecurLens Executor.
-    TASK: Execute the optimized Meta-Prompt.
+    ROLE: RecurLens V3 Executor.
+    TASK: Execute the Program.
     
-    FINAL PROMPT: "${finalMeta.draft_prompt}"
-    PLAN: ${JSON.stringify(finalMeta.plan_of_attack)}
-    CONSTRAINTS: ${JSON.stringify(finalMeta.constraints)}
-    VISUAL CONTEXT: ${JSON.stringify(finalMeta.visual_anchors)}
-    RISK LEVEL: ${finalMeta.risk_analysis.level}
+    PROGRAM:
+    - PROMPT: "${finalMeta.draft_prompt}"
+    - DAG: ${JSON.stringify(finalMeta.plan_of_attack)}
+    - CONSTRAINTS: ${JSON.stringify(finalMeta.constraints)}
+    - RISK: ${finalMeta.risk_analysis.level}
 
     INSTRUCTIONS:
-    - Execute the FINAL PROMPT.
-    - Follow the Plan of Attack.
-    - Adhere strictly to Constraints.
-    - Provide the final, high-quality solution.
+    ${finalMeta.risk_analysis.level === 'HIGH' ? `⚠️ SAFETY OVERRIDE: ${finalMeta.risk_analysis.mitigation}` : ''}
+    - Execute the DAG steps in order.
+    - Respect HARD constraints absolutely.
+    - Synthesize final answer.
   `
 };
 
@@ -366,13 +462,18 @@ import json
 from google import genai
 from google.genai import types
 
-# --- CONFIG ---
+# --- RECURLENS V3 CONFIG ---
 API_KEY = os.environ.get("API_KEY", "YOUR_API_KEY_HERE")
 client = genai.Client(api_key=API_KEY)
-MODEL_NAME = "gemini-2.5-flash"
 
-# You would implement the loop here using client.models.generate_content
-# and passing the schemas defined in the TypeScript code as 'response_schema'.
+# V3 Graph Structures would be defined here (Pydantic or TypedDict)
+# ...
+
+def run_pipeline(input_text):
+    # 1. Vision & Audio Analysis
+    # 2. Recursive Loop (Critic -> Refiner)
+    # 3. Execution (DAG Processing)
+    pass
 `;
 };
 
@@ -433,7 +534,6 @@ const RecurLensApp = () => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
 
-  // If apiKey is present, ensure modal is closed
   useEffect(() => {
     if (apiKey) setShowKeyModal(false);
   }, [apiKey]);
@@ -601,9 +701,8 @@ const RecurLensApp = () => {
     document.body.removeChild(a);
   };
 
-  // --- CORE RECURSION LOGIC ---
+  // --- CORE RECURSION LOGIC V3 ---
   
-  // Safe JSON Parse wrapper
   const safeParse = <T,>(jsonStr: string, fallback: T): T => {
       try {
           return JSON.parse(jsonStr);
@@ -617,16 +716,19 @@ const RecurLensApp = () => {
     let currentMeta = startState;
     let localHistory = [...history];
     let depth = currentMeta.metadata.iteration;
-    const MAX_DEPTH = 5;
+    const MAX_DEPTH = 5; 
 
     const ai = new GoogleGenAI({ apiKey });
+    
+    // V3: Track delta for incremental convergence
+    let prevScore = 0; 
     
     while (depth < MAX_DEPTH) {
       try {
         depth++;
         setRecursionDepth(depth);
 
-        // A. CRITIC (with Retry)
+        // --- A. META-CRITIC (V3: Robust Retry + Safety Check) ---
         addLog("system", `Running Meta-Critic (Cycle ${depth})...`);
         
         let criticOutput: CriticOutput | null = null;
@@ -648,7 +750,7 @@ const RecurLensApp = () => {
                 
                 const parsed = safeParse(rawCritic, null);
                 if (parsed && parsed.scores) {
-                    criticOutput = parsed; // Valid
+                    criticOutput = parsed; 
                 } else {
                     throw new Error("Missing scores in critic output");
                 }
@@ -657,26 +759,22 @@ const RecurLensApp = () => {
                 retryCount++;
                 if (retryCount === 2) {
                      addLog("error", "Critic failed multiple times. Using fallback.");
-                     // Fallback Critic
                      criticOutput = {
                          scores: { clarity: 0.5, completeness: 0.5, grounding: 0.5, constraints: 0.5, safety: 1, logic: 0.5, ambiguity: 0.1, actionability: 0.5 },
                          weighted_final_score: 0.5,
-                         critique_text: "System could not generate specific critique. Proceeding with general refinement.",
+                         critique_text: "System auto-recovered from critic failure.",
                          convergence_decision: "CONTINUE",
                          needs_user_clarification: false,
-                         clarification_question: "",
-                         hallucination_check: "Unknown",
-                         grounding_alignment_check: "Unknown"
+                         clarification_question: ""
                      };
                 }
             }
         }
         
-        // At this point criticOutput is definitely not null (due to fallback)
         setCriticState(criticOutput!);
         addLog("critic", criticOutput!);
 
-        // --- INTERRUPTION CHECK: CLARIFICATION ---
+        // --- B. CLARIFICATION GATE ---
         if (criticOutput!.needs_user_clarification) {
           addLog("system", "⚠️ Ambiguity Detected. Pausing for user clarification.");
           setClarificationQuestion(criticOutput!.clarification_question || "Please clarify your request.");
@@ -687,28 +785,29 @@ const RecurLensApp = () => {
           return;
         }
 
-        // --- CONVERGENCE CHECK ---
-        let similarity = 0;
-        if (localHistory.length > 0) {
-           similarity = calculateCosineSimilarity(localHistory[localHistory.length - 1].draft_prompt, currentMeta.draft_prompt);
-           addLog("system", `Drift/Similarity Check: ${(similarity * 100).toFixed(1)}%`);
-        }
+        // --- C. INCREMENTAL CONVERGENCE CHECK (V3) ---
+        const currentScore = criticOutput!.weighted_final_score || 0;
+        const scoreDelta = Math.abs(currentScore - prevScore);
+        const isStagnant = depth > 1 && scoreDelta < 0.015; // Improvement plateau
+        const isGoodEnough = currentScore > 0.92;
+        
+        // Safety Gate
+        const riskLevel = currentMeta.risk_analysis.level;
+        const safetyScore = criticOutput!.scores.safety;
+        const isUnsafe = riskLevel === 'HIGH' && safetyScore < 0.85;
 
-        // Robust check: Ensure weighted_final_score exists and is a number
-        const score = criticOutput!.weighted_final_score || 0;
-
-        if (
-          criticOutput!.convergence_decision === "STOP" || 
-          score > 0.88 ||
-          (depth > 1 && similarity > 0.98)
-        ) {
-          addLog("system", "Convergence Threshold Met. Executing...");
+        if (!isUnsafe && (criticOutput!.convergence_decision === "STOP" || isGoodEnough || isStagnant)) {
+          if (isStagnant) addLog("system", "Convergence: Improvement Stagnated. Executing...");
+          else addLog("system", "Convergence: Threshold Met. Executing...");
+          
           setRecursionHistory(localHistory);
           await executeFinal(currentMeta);
           return;
         }
 
-        // B. REFINER
+        prevScore = currentScore;
+
+        // --- D. REFINER (V3: Explicit Strategy Selection) ---
         addLog("system", `Refining Meta-Prompt (Cycle ${depth})...`);
         localHistory.push(currentMeta);
         setRecursionHistory(localHistory);
@@ -725,9 +824,9 @@ const RecurLensApp = () => {
         const rawRefiner = refineResp.text || "{}";
         addLog("debug", `[REFINER RAW]: ${rawRefiner}`);
 
-        let nextMeta: MetaPromptState = safeParse(rawRefiner, currentMeta); // Fallback to current if parse fails
+        let nextMeta: MetaPromptState = safeParse(rawRefiner, currentMeta);
         
-        // Ensure critical fields exist to prevent partial updates
+        // Enforce metadata updates
         nextMeta.metadata = { iteration: depth, timestamp: new Date().toISOString() };
         if (!nextMeta.user_sentiment && startState.user_sentiment) {
           nextMeta.user_sentiment = startState.user_sentiment;
@@ -741,8 +840,7 @@ const RecurLensApp = () => {
 
       } catch (err) {
         console.error("Recursion Step Error:", err);
-        addLog("error", `Recursion Error at Depth ${depth}. Forcing execution to prevent hang. Error: ${(err as Error).message}`);
-        // Fallback: If recursion fails hard, stop and execute what we have.
+        addLog("error", `Recursion Error at Depth ${depth}. Forcing execution. Error: ${(err as Error).message}`);
         setRecursionHistory(localHistory);
         await executeFinal(currentMeta);
         return;
@@ -764,12 +862,17 @@ const RecurLensApp = () => {
       finalMeta.required_tools?.includes('googleSearch');
 
     const executorConfig: any = {
-      thinkingConfig: { thinkingBudget: 4096 } // Cognitive Depth
+      thinkingConfig: { thinkingBudget: 4096 } // Deep Thinking
     };
 
     if (useSearch) {
       executorConfig.tools = [{ googleSearch: {} }];
       addLog("system", "Enabled: Google Search Grounding");
+    }
+
+    // Safety Gate Pre-check
+    if (finalMeta.risk_analysis.level === "HIGH") {
+         addLog("system", `🛡️ SAFETY GATE ACTIVE: ${finalMeta.risk_analysis.mitigation}`);
     }
 
     addLog("system", "Executing Final Prompt with Cognitive Thinking...");
@@ -808,13 +911,12 @@ const RecurLensApp = () => {
       }
 
       if (finalMeta.risk_analysis?.level === "HIGH") {
-        setFinalOutput(prev => `⚠️ SAFETY ADVISORY: ${finalMeta.risk_analysis.mitigation}\n\n` + (prev || ""));
+        setFinalOutput(prev => `⚠️ **SAFETY ADVISORY**: ${finalMeta.risk_analysis.mitigation}\n\n---\n\n` + (prev || ""));
       }
       
       addLog("success", "Execution Complete.");
 
       // --- VISUALIZATION PHASE ---
-      // Generate image if appropriate (not for simple Q&A, usually good for most meta-tasks)
       if (finalMeta.task_type === 'Creative' || finalMeta.task_type === 'Planning' || finalMeta.task_type === 'Troubleshooting' || (finalMeta.visual_anchors && finalMeta.visual_anchors.length > 0)) {
         setIsVisualizing(true);
         addLog("system", "Generating visual artifact...");
@@ -878,8 +980,8 @@ const RecurLensApp = () => {
     const ai = new GoogleGenAI({ apiKey });
     
     try {
-      addLog("system", "Starting Vision Module...");
-      let visionData: VisionAnalysis = { captions: [], objects: [], spatial_relations: "", ambiguities: [], scene_summary: "No image provided." };
+      addLog("system", "Starting Vision Module (V3)...");
+      let visionData: VisionAnalysis = { captions: [], regions: [], objects: [], spatial_relations: "", scene_summary: "No image provided." };
       
       if (selectedImage) {
         const base64Data = selectedImage.split(',')[1];
@@ -1059,7 +1161,7 @@ const RecurLensApp = () => {
             </div>
             <div>
               <h1 className="text-lg font-bold tracking-tight text-white flex items-center">
-                RecurLens <span className="text-[10px] ml-2 px-1.5 py-0.5 rounded border border-indigo-500/30 text-indigo-400 bg-indigo-500/10 font-mono">v2.0</span>
+                RecurLens <span className="text-[10px] ml-2 px-1.5 py-0.5 rounded border border-indigo-500/30 text-indigo-400 bg-indigo-500/10 font-mono">v3.0</span>
               </h1>
             </div>
           </div>
@@ -1256,7 +1358,16 @@ const RecurLensApp = () => {
                        ) : log.type === 'vision' ? (
                           <div className="bg-indigo-950/20 p-2 rounded border border-indigo-500/10">
                             <div className="text-indigo-200 mb-1">"{log.content?.scene_summary || 'No summary'}"</div>
-                            <div className="text-[10px] text-indigo-400/70">Objects: {log.content?.objects?.join(", ") || 'None'}</div>
+                            <div className="flex flex-wrap gap-1 mt-1">
+                              {log.content?.regions?.map((r: VisionRegion, i: number) => (
+                                <span key={i} className="text-[9px] bg-indigo-500/20 text-indigo-300 px-1 rounded flex items-center" title={r.description}>
+                                  <Scan className="w-2 h-2 mr-1"/> {r.id}
+                                </span>
+                              ))}
+                              {log.content?.objects?.map((obj: VisionObject, i: number) => (
+                                <span key={i} className="text-[9px] border border-indigo-500/20 text-indigo-400 px-1 rounded">{obj.name}</span>
+                              ))}
+                            </div>
                           </div>
                        ) : log.type === 'critic' ? (
                           <div className="bg-rose-950/20 p-2 rounded border border-rose-500/10">
@@ -1271,8 +1382,9 @@ const RecurLensApp = () => {
                              <div className="text-purple-200 line-clamp-3 group-hover:line-clamp-none transition-all cursor-default">
                                {log.content?.draft_prompt || 'No draft generated'}
                              </div>
-                             <div className="mt-2 flex gap-2">
-                               <span className="text-[9px] bg-purple-500/20 text-purple-300 px-1.5 py-0.5 rounded">Risk: {log.content?.risk_analysis?.level || 'UNKNOWN'}</span>
+                             <div className="mt-2 flex gap-2 flex-wrap">
+                               {log.content?.risk_analysis?.level === "HIGH" && <span className="text-[9px] bg-red-500/20 text-red-300 px-1.5 py-0.5 rounded border border-red-500/30 flex items-center"><AlertTriangle className="w-3 h-3 mr-1"/> High Risk</span>}
+                               {log.content?.refinement_strategy && <span className="text-[9px] bg-purple-500/30 text-purple-200 px-1.5 py-0.5 rounded border border-purple-500/30 font-bold">{log.content.refinement_strategy}</span>}
                                {log.content?.user_sentiment && <span className="text-[9px] bg-blue-500/20 text-blue-300 px-1.5 py-0.5 rounded">Tone: {log.content.user_sentiment.tone}</span>}
                              </div>
                           </div>
@@ -1378,16 +1490,46 @@ const RecurLensApp = () => {
                 <div className="absolute inset-0 p-4">
                   {viewMode === 'state' ? (
                     currentState ? (
-                      <pre className="text-[10px] font-mono text-emerald-500/90 whitespace-pre-wrap break-all leading-relaxed">
-                        {JSON.stringify(currentState, null, 2)}
-                      </pre>
+                      <div className="space-y-4">
+                        <div>
+                          <div className="text-[10px] font-bold text-gray-500 mb-1 flex items-center"><Network className="w-3 h-3 mr-1"/> PLAN GRAPH (DAG)</div>
+                          <div className="space-y-1">
+                             {currentState.plan_of_attack.map((step, i) => (
+                               <div key={i} className="flex items-start text-[10px] font-mono text-gray-300 bg-gray-900/50 p-1.5 rounded border border-white/5">
+                                 <span className="text-indigo-400 w-6 shrink-0">{step.step_id}</span>
+                                 <div className="flex-1">{step.action}</div>
+                                 <span className="text-gray-600 text-[9px] ml-2">{step.logic_type}</span>
+                               </div>
+                             ))}
+                          </div>
+                        </div>
+                        <div>
+                           <div className="text-[10px] font-bold text-gray-500 mb-1 flex items-center"><Anchor className="w-3 h-3 mr-1"/> CONSTRAINT LATTICE</div>
+                           <div className="flex flex-wrap gap-1">
+                             {currentState.constraints.map((c, i) => (
+                               <div key={i} className={`text-[9px] px-2 py-1 rounded border flex items-center ${c.type === 'HARD' ? 'bg-red-950/30 border-red-500/30 text-red-300' : 'bg-blue-950/30 border-blue-500/30 text-blue-300'}`}>
+                                  <span className="font-bold mr-1">{c.id}:</span> {c.description}
+                               </div>
+                             ))}
+                           </div>
+                        </div>
+                        <div>
+                           <div className="text-[10px] font-bold text-gray-500 mb-1">RAW JSON</div>
+                           <pre className="text-[9px] font-mono text-emerald-500/70 whitespace-pre-wrap break-all leading-relaxed opacity-50">
+                             {JSON.stringify(currentState, null, 2)}
+                           </pre>
+                        </div>
+                      </div>
                     ) : <div className="text-gray-700 text-xs font-mono mt-4 text-center">System Idle</div>
                   ) : (
                     <div className="space-y-6">
                       {recursionHistory.map((h, i) => (
                          <div key={i} className="relative pl-4 border-l border-gray-800">
                             <div className="absolute -left-[3px] top-0 w-1.5 h-1.5 rounded-full bg-indigo-500"></div>
-                            <div className="text-[10px] text-gray-500 mb-1 font-mono">Iteration {h.metadata.iteration}</div>
+                            <div className="flex justify-between items-center mb-1">
+                                <span className="text-[10px] text-gray-500 font-mono">Iteration {h.metadata.iteration}</span>
+                                <span className="text-[9px] bg-indigo-500/20 text-indigo-300 px-1 rounded">{h.refinement_strategy}</span>
+                            </div>
                             <div className="bg-gray-900/50 p-2 rounded border border-white/5 text-[10px] text-gray-400 font-mono">
                                {h.draft_prompt}
                             </div>
