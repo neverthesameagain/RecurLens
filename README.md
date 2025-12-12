@@ -1,24 +1,38 @@
-# RecurLens: Recursive Multimodal Meta-Reasoning Engine
 
-> "Quantifying the mediocrity of human input."
+
+# RecurLens: A Multimodal AI That Thinks Before It Answers
+
+> *From guessing to understanding.*
 
 ![License](https://img.shields.io/badge/License-MIT-000000.svg?style=flat-square)
 ![Status](https://img.shields.io/badge/Status-Research_Preview-important?style=flat-square)
-![Compute](https://img.shields.io/badge/Compute-Heavy-critical?style=flat-square)
+![Compute](https://img.shields.io/badge/Compute-Inference_Heavy-critical?style=flat-square)
+
+---
 
 ## 1. Abstract
 
-RecurLens is not a chatbot. It is a **hostile reasoning architecture** designed to mistrust user input by default.
+Modern AI systems respond too quickly.
 
-Most AI wrappers take a user's vague prompt and immediately hallucinate an answer. RecurLens refuses to do this. Instead, it ingests multimodal data (vision, audio, text), constructs a **Directed Acyclic Graph (DAG)** of the problem space, and enters a recursive self-improvement loop. It critiques its own plan, mathematically verifies constraints, and only executes once the internal confidence score exceeds a 0.92 threshold.
+In everyday use, people give vague instructions, incomplete descriptions, or point at things and say *“help me with this.”*
+Most assistants immediately guess — often confidently, sometimes dangerously.
 
-This project exists to prove that **inference-time compute** (thinking before speaking) is the only viable path to AGI. It is over-engineered, computationally expensive, and technically superior to linear prompting chains.
+**RecurLens is designed to solve this problem.**
+
+RecurLens is a **recursive, multimodal reasoning system** built on Gemini that deliberately pauses before responding. It listens to speech, analyzes images, evaluates ambiguity, and iteratively refines its own understanding before producing an answer.
+
+Instead of mapping *input → output*, RecurLens performs:
+
+> **input → understanding → self-critique → refinement → execution**
+
+This project demonstrates that **inference-time reasoning**, not faster generation, is the key to building AI systems that work reliably in the real world.
 
 ---
 
 ## 2. System Architecture
 
-We do not use linear chains. We use evolving graph states.
+RecurLens does not operate as a linear prompt chain.
+It maintains an evolving **graph-structured state** that represents what the system believes the user means.
 
 ### State Evolution Graph
 
@@ -54,72 +68,110 @@ graph TD
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant S as SystemState
+    participant S as System State
     participant C as Critic
     participant R as Refiner
     participant E as Executor
 
-    U->>S: Input (Image + Audio)
-    S->>S: Initialize Constraints Lattice
+    U->>S: Multimodal Input
+    S->>S: Initialize Constraints & Assumptions
     
-    loop Recursion (Max 5)
-        S->>C: Evaluate Current Graph
+    loop Recursive Reasoning (≤ 5)
+        S->>C: Evaluate Current Understanding
         C-->>S: Score Vector + Failure Analysis
         
         alt Score < Threshold
-            S->>R: Request Optimization Strategy
-            R->>S: Mutate Graph (Expand/Compress/Localize)
-        else Score >= Threshold
-            S->>E: Commit to Execution Plan
+            S->>R: Select Refinement Strategy
+            R->>S: Mutate State (Expand / Correct / Localize)
+        else Score ≥ Threshold
+            S->>E: Commit Execution Plan
         end
     end
     
-    E->>U: Final Multimodal Artifact
+    E->>U: Final Answer (Text / Speech / Image)
 ```
 
 ---
 
-## 3. Why This Wins Hackathons
+## 3. What Problem This Solves (and Why It Matters)
 
-If you are a judge evaluating this project, please note the following technical differentiators:
+### A. Everyday Ambiguity
 
-### A. The "Lazy User" Solution
-Users are terrible at prompting. RecurLens automates the prompt engineering process by recursively rewriting the task description until it is mathematically unambiguous.
+People rarely give precise instructions.
+They speak casually, gesture at images, omit constraints, and assume shared context.
 
-### B. True Multimodal Grounding (Not Just Context)
-We do not simply paste an image into the LLM context. The **Vision Module** extracts specific regions (e.g., `Region R1: Top-Left, Saliency 0.8`) and forces the **Refiner** to bind logical arguments to these pixel coordinates. If the model hallucinates an object that isn't visually present, the **Critic** kills the branch.
-
-### C. Safety as a Graph Constraint
-Safety is not an afterthought or an RLHF filter. It is a node in the state graph. If the `RiskAnalysis` node flags a high-risk scenario, the execution graph is locked until a mitigation strategy is inserted into the plan.
-
-### D. The "Sci-Fi" Interface
-The UI does not hide the complexity; it celebrates it. Users can see the system "thinking" in real-time, watching the log trace as the AI argues with itself. This visibility creates a "wow" factor that standard chat interfaces lack.
+RecurLens treats ambiguity as a **first-class signal**, not a failure case.
 
 ---
 
-## 4. Operational Protocol
+### B. Multimodal Grounding That Actually Grounds
+
+Images are not just appended to context.
+
+The vision system extracts **salient regions** and forces reasoning steps to explicitly reference them.
+If the system invents an object or misreads the image, the Critic detects the mismatch and blocks execution.
+
+---
+
+### C. Safety as a Structural Property
+
+Safety is embedded into the reasoning graph itself.
+
+If a scenario is flagged as high-risk (hardware, health, infrastructure), execution is paused until the plan includes explicit mitigation steps or requests user confirmation.
+
+---
+
+### D. Transparency Over Illusion
+
+RecurLens exposes its internal reasoning loop.
+
+Users can observe how the system critiques its own understanding and refines it. This transparency builds trust and highlights how modern multimodal reasoning actually works.
+
+---
+
+## 4. Why is it needed?
+
+RecurLens is only feasible because of recent advances in Gemini:
+
+* Native multimodal reasoning across speech, vision, and text
+* Long-context self-reflection
+* Fast inference suitable for iterative reasoning
+* Tool use (search, image generation, speech synthesis)
+
+This project reframes Gemini not as a chatbot, but as a **thinking substrate**.
+
+---
+
+## 5. Operational Flow
 
 ### Prerequisites
-You need a Google Cloud Project with a paid billing account. RecurLens uses the **Gemini 2.5** series with Thinking and Search enabled. Do not attempt to run this on free-tier quotas; the recursion loop will eat them for breakfast.
 
-### Initialization
-1.  **Inject Credential**: The system requires a valid API key on startup.
-2.  **Multimodal Injection**: Speak (we analyze tone urgency) or Upload (we analyze spatial relations).
-3.  **Recursion Phase**: The system will pause. Watch the logs. It is criticizing your input. Do not be offended.
-4.  **Convergence**: Once the system is satisfied with its own plan, it will generate the final output.
+A Google Cloud project with Gemini access and billing enabled. RecurLens relies on recursive inference and is designed for paid-tier usage.
 
----
+### Usage
 
-## 5. Technical Stack
-
-*   **Core Logic**: TypeScript (Strict Schema Validation)
-*   **Frontend**: React + Tailwind (Glassmorphism UI)
-*   **Inference**: Google GenAI SDK (Gemini 2.5 Flash + Pro)
-*   **Audio**: Web Audio API (16kHz PCM Processing)
-*   **State**: Graph-based immutable state history
+1. Provide input via speech, image, or text.
+2. The system pauses to analyze tone, visual evidence, and ambiguity.
+3. Internal reasoning iterations are logged and visualized.
+4. Once confidence stabilizes, the final output is produced.
 
 ---
 
-## 6. License
+## 6. Technical Stack
 
-MIT. You are free to fork this architecture, provided you acknowledge that linear prompting is dead.
+* **Core Logic**: TypeScript (strict schema validation, immutable state)
+* **Frontend**: React + Tailwind (state visualization)
+* **Inference**: Google GenAI SDK (Gemini Pro / Flash)
+* **Audio**: Web Audio API (ASR + tone analysis)
+* **State Management**: Graph-based reasoning history
+
+---
+
+## 7. License
+
+MIT License.
+
+RecurLens is open for experimentation, extension, and critique.
+Linear prompting is not sufficient for real-world AI systems — this project explores what comes next.
+
+---
