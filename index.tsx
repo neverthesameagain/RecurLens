@@ -31,7 +31,8 @@ import {
   Lock,
   Layers,
   Terminal as TerminalIcon,
-  Search
+  Search,
+  ImageIcon
 } from 'lucide-react';
 
 // --- UTILITIES ---
@@ -39,7 +40,14 @@ import {
 const cleanJson = (text: string) => {
   if (!text) return "{}";
   let clean = text.trim();
-  clean = clean.replace(/^```json\s*/, '').replace(/^```\s*/, '').replace(/\s*```$/, '');
+  // Remove markdown code blocks if present
+  clean = clean.replace(/```json/g, '').replace(/```/g, '');
+  // Attempt to find the first '{' and last '}' to extract valid JSON if there is extra text
+  const firstBrace = clean.indexOf('{');
+  const lastBrace = clean.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace !== -1) {
+    clean = clean.substring(firstBrace, lastBrace + 1);
+  }
   return clean;
 };
 
@@ -336,11 +344,13 @@ const RecurLensApp = () => {
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
+  const [isVisualizing, setIsVisualizing] = useState(false);
   const [logs, setLogs] = useState<{type: string, content: any, timestamp: number}[]>([]);
   
   const [currentState, setCurrentState] = useState<MetaPromptState | null>(null);
   const [criticState, setCriticState] = useState<CriticOutput | null>(null);
   const [finalOutput, setFinalOutput] = useState<string | null>(null);
+  const [generatedImage, setGeneratedImage] = useState<string | null>(null);
   const [groundingUrls, setGroundingUrls] = useState<{title: string, uri: string}[]>([]);
   
   // Recursion State
@@ -503,12 +513,14 @@ const RecurLensApp = () => {
     setRecursionHistory([]);
     setInputText("");
     setSelectedImage(null);
+    setGeneratedImage(null);
     setGroundingUrls([]);
     setIsSpeaking(false);
     setIsWaitingForClarification(false);
     setClarificationQuestion("");
     setDetectedTone(null);
     setIsThinking(false);
+    setIsVisualizing(false);
     visionDataRef.current = null;
     originalTranscriptRef.current = "";
     audioAnalysisRef.current = null;
@@ -526,6 +538,16 @@ const RecurLensApp = () => {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
+  
+  const downloadImage = () => {
+    if (!generatedImage) return;
+    const a = document.createElement('a');
+    a.href = generatedImage;
+    a.download = `RecurLens_Visual_${Date.now()}.png`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
 
   // --- CORE RECURSION LOGIC ---
   
@@ -538,72 +560,83 @@ const RecurLensApp = () => {
     const ai = new GoogleGenAI({ apiKey });
     
     while (depth < MAX_DEPTH) {
-      depth++;
-      setRecursionDepth(depth);
+      try {
+        depth++;
+        setRecursionDepth(depth);
 
-      // A. CRITIC
-      addLog("system", `Running Meta-Critic (Cycle ${depth})...`);
-      const criticResp = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: PROMPTS.CRITIC(currentMeta, originalTranscriptRef.current, visionDataRef.current!),
-        config: { responseMimeType: "application/json" }
-      });
-      
-      const criticOutput: CriticOutput = JSON.parse(cleanJson(criticResp.text || "{}"));
-      setCriticState(criticOutput);
-      addLog("critic", criticOutput);
+        // A. CRITIC
+        addLog("system", `Running Meta-Critic (Cycle ${depth})...`);
+        const criticResp = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: PROMPTS.CRITIC(currentMeta, originalTranscriptRef.current, visionDataRef.current!),
+          config: { responseMimeType: "application/json" }
+        });
+        
+        const criticText = cleanJson(criticResp.text || "{}");
+        const criticOutput: CriticOutput = JSON.parse(criticText);
+        setCriticState(criticOutput);
+        addLog("critic", criticOutput);
 
-      // --- INTERRUPTION CHECK: CLARIFICATION ---
-      if (criticOutput.needs_user_clarification) {
-        addLog("system", "⚠️ Ambiguity Detected. Pausing for user clarification.");
-        setClarificationQuestion(criticOutput.clarification_question);
-        setIsWaitingForClarification(true);
-        setCurrentState(currentMeta); 
+        // --- INTERRUPTION CHECK: CLARIFICATION ---
+        if (criticOutput.needs_user_clarification) {
+          addLog("system", "⚠️ Ambiguity Detected. Pausing for user clarification.");
+          setClarificationQuestion(criticOutput.clarification_question);
+          setIsWaitingForClarification(true);
+          setCurrentState(currentMeta); 
+          setRecursionHistory(localHistory);
+          setIsProcessing(false);
+          return;
+        }
+
+        // --- CONVERGENCE CHECK ---
+        let similarity = 0;
+        if (localHistory.length > 0) {
+           similarity = calculateCosineSimilarity(localHistory[localHistory.length - 1].draft_prompt, currentMeta.draft_prompt);
+           addLog("system", `Drift/Similarity Check: ${(similarity * 100).toFixed(1)}%`);
+        }
+
+        if (
+          criticOutput.convergence_decision === "STOP" || 
+          criticOutput.weighted_final_score > 0.88 ||
+          (depth > 1 && similarity > 0.98)
+        ) {
+          addLog("system", "Convergence Threshold Met. Executing...");
+          setRecursionHistory(localHistory);
+          await executeFinal(currentMeta);
+          return;
+        }
+
+        // B. REFINER
+        addLog("system", `Refining Meta-Prompt (Cycle ${depth})...`);
+        localHistory.push(currentMeta);
         setRecursionHistory(localHistory);
-        setIsProcessing(false);
-        return;
-      }
+        
+        const refineResp = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: PROMPTS.REFINER(currentMeta, criticOutput, localHistory),
+          config: { responseMimeType: "application/json" }
+        });
 
-      // --- CONVERGENCE CHECK ---
-      let similarity = 0;
-      if (localHistory.length > 0) {
-         similarity = calculateCosineSimilarity(localHistory[localHistory.length - 1].draft_prompt, currentMeta.draft_prompt);
-         addLog("system", `Drift/Similarity Check: ${(similarity * 100).toFixed(1)}%`);
-      }
+        currentMeta = JSON.parse(cleanJson(refineResp.text || "{}"));
+        currentMeta.metadata = { iteration: depth, timestamp: new Date().toISOString() };
+        
+        if (!currentMeta.user_sentiment && startState.user_sentiment) {
+          currentMeta.user_sentiment = startState.user_sentiment;
+        }
+        
+        setCurrentState(currentMeta);
+        addLog("refiner", currentMeta);
+        
+        await new Promise(r => setTimeout(r, 800)); 
 
-      if (
-        criticOutput.convergence_decision === "STOP" || 
-        criticOutput.weighted_final_score > 0.88 ||
-        (depth > 1 && similarity > 0.98)
-      ) {
-        addLog("system", "Convergence Threshold Met. Executing...");
+      } catch (err) {
+        console.error("Recursion Step Error:", err);
+        addLog("error", `Recursion Error at Depth ${depth}. Forcing execution to prevent hang. Error: ${(err as Error).message}`);
+        // Fallback: If recursion fails (e.g. malformed JSON from LLM), stop and execute what we have.
         setRecursionHistory(localHistory);
         await executeFinal(currentMeta);
         return;
       }
-
-      // B. REFINER
-      addLog("system", `Refining Meta-Prompt (Cycle ${depth})...`);
-      localHistory.push(currentMeta);
-      setRecursionHistory(localHistory);
-      
-      const refineResp = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: PROMPTS.REFINER(currentMeta, criticOutput, localHistory),
-        config: { responseMimeType: "application/json" }
-      });
-
-      currentMeta = JSON.parse(cleanJson(refineResp.text || "{}"));
-      currentMeta.metadata = { iteration: depth, timestamp: new Date().toISOString() };
-      
-      if (!currentMeta.user_sentiment && startState.user_sentiment) {
-        currentMeta.user_sentiment = startState.user_sentiment;
-      }
-      
-      setCurrentState(currentMeta);
-      addLog("refiner", currentMeta);
-      
-      await new Promise(r => setTimeout(r, 800)); 
     }
 
     addLog("system", "Max recursion depth reached. Forcing execution.");
@@ -631,6 +664,8 @@ const RecurLensApp = () => {
 
     addLog("system", "Executing Final Prompt with Cognitive Thinking...");
 
+    let capturedFinalOutput = "";
+
     try {
       const execRespStream = await ai.models.generateContentStream({
         model: 'gemini-2.5-flash',
@@ -638,11 +673,10 @@ const RecurLensApp = () => {
         config: executorConfig
       });
 
-      let fullText = "";
       for await (const chunk of execRespStream) {
         if (chunk.text) {
-          fullText += chunk.text;
-          setFinalOutput(fullText);
+          capturedFinalOutput += chunk.text;
+          setFinalOutput(capturedFinalOutput);
         }
         
         const chunks = chunk.candidates?.[0]?.groundingMetadata?.groundingChunks;
@@ -664,15 +698,48 @@ const RecurLensApp = () => {
       }
 
       if (finalMeta.risk_analysis.level === "HIGH") {
-        setFinalOutput(prev => `⚠️ SAFETY ADVISORY: ${finalMeta.risk_analysis.mitigation}\n\n` + prev);
+        setFinalOutput(prev => `⚠️ SAFETY ADVISORY: ${finalMeta.risk_analysis.mitigation}\n\n` + (prev || ""));
+      }
+      
+      addLog("success", "Execution Complete.");
+
+      // --- VISUALIZATION PHASE ---
+      // Generate image if appropriate (not for simple Q&A, usually good for most meta-tasks)
+      if (finalMeta.task_type === 'Creative' || finalMeta.task_type === 'Planning' || finalMeta.task_type === 'Troubleshooting' || finalMeta.visual_anchors.length > 0) {
+        setIsVisualizing(true);
+        addLog("system", "Generating visual artifact...");
+        
+        try {
+            const vizPrompt = `Create a high-quality, photorealistic illustration or diagram that visually represents this concept: ${capturedFinalOutput.substring(0, 500)}. Make it clean, professional and relevant to the context.`;
+            
+            const imageResp = await ai.models.generateContent({
+                model: 'gemini-2.5-flash-image',
+                contents: { parts: [{ text: vizPrompt }] }
+            });
+            
+            // Find image part
+            for (const part of imageResp.candidates?.[0]?.content?.parts || []) {
+                if (part.inlineData) {
+                    const base64Str = part.inlineData.data;
+                    setGeneratedImage(`data:image/png;base64,${base64Str}`);
+                    addLog("success", "Visual Artifact Generated.");
+                    break;
+                }
+            }
+        } catch (vizError) {
+            console.error("Visual generation failed", vizError);
+            addLog("error", "Visual generation failed (Quota or Model issue).");
+        } finally {
+            setIsVisualizing(false);
+        }
       }
 
-      addLog("success", "Execution Complete.");
     } catch(e) {
       addLog("error", "Execution Failed: " + (e as Error).message);
     } finally {
       setIsProcessing(false);
       setIsThinking(false);
+      setIsVisualizing(false);
     }
   };
 
@@ -691,6 +758,7 @@ const RecurLensApp = () => {
     setCurrentState(null);
     setCriticState(null);
     setGroundingUrls([]);
+    setGeneratedImage(null);
     setRecursionDepth(0);
     setRecursionHistory([]);
     setIsWaitingForClarification(false);
@@ -875,9 +943,9 @@ const RecurLensApp = () => {
           
           <div className="flex items-center space-x-3">
              <div className="hidden md:flex items-center px-3 py-1.5 rounded-full bg-black/20 border border-white/5 backdrop-blur-sm">
-                <div className={`w-2 h-2 rounded-full mr-2 ${isProcessing ? 'bg-amber-400 animate-pulse' : 'bg-emerald-500'}`}></div>
+                <div className={`w-2 h-2 rounded-full mr-2 ${isVisualizing ? 'bg-pink-400 animate-pulse' : isThinking ? 'bg-amber-400 animate-pulse' : isProcessing ? 'bg-indigo-500 animate-pulse' : 'bg-emerald-500'}`}></div>
                 <span className="text-[10px] font-mono text-gray-400 uppercase tracking-wider">
-                  {isWaitingForClarification ? 'AWAITING USER' : isThinking ? 'DEEP THINKING' : isProcessing ? 'PROCESSING' : 'IDLE'}
+                  {isWaitingForClarification ? 'AWAITING USER' : isVisualizing ? 'VISUALIZING' : isThinking ? 'DEEP THINKING' : isProcessing ? 'PROCESSING' : 'IDLE'}
                 </span>
              </div>
              <button onClick={() => setShowCode(true)} className="p-2 text-gray-400 hover:text-white transition-colors" title="Export Code"><FileJson className="w-5 h-5" /></button>
@@ -1087,11 +1155,11 @@ const RecurLensApp = () => {
         <div className="lg:col-span-4 flex flex-col gap-6 h-[80vh] lg:h-auto">
           
           {/* Final Output Card */}
-          <div className={`glass-panel rounded-2xl flex flex-col min-h-[300px] transition-all duration-500 ${isThinking ? 'ring-1 ring-indigo-500 shadow-[0_0_40px_-10px_rgba(99,102,241,0.3)]' : ''}`}>
+          <div className={`glass-panel rounded-2xl flex flex-col min-h-[300px] transition-all duration-500 ${isVisualizing ? 'ring-1 ring-pink-500 shadow-[0_0_40px_-10px_rgba(236,72,153,0.3)]' : isThinking ? 'ring-1 ring-indigo-500 shadow-[0_0_40px_-10px_rgba(99,102,241,0.3)]' : ''}`}>
              <div className="p-4 border-b border-white/5 flex justify-between items-center bg-white/5 rounded-t-2xl">
                 <h3 className="text-xs font-bold text-gray-400 uppercase tracking-widest flex items-center">
-                   {isThinking ? <Loader2 className="w-3 h-3 mr-2 animate-spin text-indigo-400"/> : <Sparkles className="w-3 h-3 mr-2 text-yellow-400"/>}
-                   {isThinking ? <span className="text-indigo-400 animate-pulse">Synthesizing...</span> : "Final Output"}
+                   {isVisualizing ? <Sparkles className="w-3 h-3 mr-2 animate-pulse text-pink-400"/> : isThinking ? <Loader2 className="w-3 h-3 mr-2 animate-spin text-indigo-400"/> : <Sparkles className="w-3 h-3 mr-2 text-yellow-400"/>}
+                   {isVisualizing ? <span className="text-pink-400 animate-pulse">Generating Visual...</span> : isThinking ? <span className="text-indigo-400 animate-pulse">Synthesizing...</span> : "Final Output"}
                 </h3>
                 <div className="flex space-x-1">
                    {finalOutput && (
@@ -1105,21 +1173,40 @@ const RecurLensApp = () => {
              
              <div className="flex-1 p-5 overflow-y-auto relative custom-scrollbar bg-black/20">
                 {finalOutput ? (
-                  <div className="prose prose-invert prose-sm max-w-none">
-                    {finalOutput.split('\n').map((line, i) => (
-                      <p key={i} className="mb-3 text-gray-300 leading-relaxed animate-in fade-in duration-700 slide-in-from-bottom-2" style={{animationDelay: `${i * 50}ms`}}>{line}</p>
-                    ))}
+                  <div className="space-y-6">
+                    {/* Visual Generation Output */}
+                    {generatedImage && (
+                        <div className="relative group rounded-xl overflow-hidden border border-white/10 shadow-lg animate-in fade-in duration-1000">
+                             <img src={generatedImage} alt="Generated Visualization" className="w-full h-auto object-cover" />
+                             <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                                 <button onClick={downloadImage} className="bg-white/10 backdrop-blur text-white px-3 py-2 rounded-lg text-xs font-bold flex items-center hover:bg-white/20 transition-all border border-white/20">
+                                     <Download className="w-4 h-4 mr-2" /> Download Visual
+                                 </button>
+                             </div>
+                             <div className="absolute bottom-2 right-2 px-2 py-1 bg-black/60 rounded text-[10px] text-gray-300 backdrop-blur font-mono flex items-center">
+                                 <ImageIcon className="w-3 h-3 mr-1" /> Generated with Gemini
+                             </div>
+                        </div>
+                    )}
+                    
+                    <div className="prose prose-invert prose-sm max-w-none">
+                      {finalOutput.split('\n').map((line, i) => (
+                        <p key={i} className="mb-3 text-gray-300 leading-relaxed animate-in fade-in duration-700 slide-in-from-bottom-2" style={{animationDelay: `${i * 50}ms`}}>{line}</p>
+                      ))}
+                    </div>
                   </div>
-                ) : isThinking ? (
+                ) : isThinking || isVisualizing ? (
                    <div className="absolute inset-0 flex flex-col items-center justify-center">
                       <div className="relative">
-                         <div className="w-16 h-16 rounded-full border-t-2 border-r-2 border-indigo-500 animate-spin"></div>
+                         <div className={`w-16 h-16 rounded-full border-t-2 border-r-2 ${isVisualizing ? 'border-pink-500' : 'border-indigo-500'} animate-spin`}></div>
                          <div className="w-16 h-16 rounded-full border-b-2 border-l-2 border-purple-500 animate-spin absolute inset-0 animation-delay-2000 reverse"></div>
                          <div className="absolute inset-0 flex items-center justify-center">
-                            <Brain className="w-6 h-6 text-indigo-400 animate-pulse" />
+                            <Brain className={`w-6 h-6 ${isVisualizing ? 'text-pink-400' : 'text-indigo-400'} animate-pulse`} />
                          </div>
                       </div>
-                      <span className="mt-4 text-xs font-mono text-indigo-400 animate-pulse">Optimizing Vectors...</span>
+                      <span className={`mt-4 text-xs font-mono ${isVisualizing ? 'text-pink-400' : 'text-indigo-400'} animate-pulse`}>
+                          {isVisualizing ? "Rendering Pixels..." : "Optimizing Vectors..."}
+                      </span>
                    </div>
                 ) : (
                    <div className="h-full flex items-center justify-center text-gray-600 text-xs italic">
