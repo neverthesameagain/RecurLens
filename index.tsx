@@ -32,7 +32,8 @@ import {
   Layers,
   Terminal as TerminalIcon,
   Search,
-  ImageIcon
+  ImageIcon,
+  Bug
 } from 'lucide-react';
 
 // --- UTILITIES ---
@@ -45,13 +46,18 @@ const cleanJson = (text: string) => {
   // Attempt to find the first '{' and last '}' to extract valid JSON if there is extra text
   const firstBrace = clean.indexOf('{');
   const lastBrace = clean.lastIndexOf('}');
+  
   if (firstBrace !== -1 && lastBrace !== -1) {
-    clean = clean.substring(firstBrace, lastBrace + 1);
+    return clean.substring(firstBrace, lastBrace + 1);
   }
-  return clean;
+  
+  // If no braces found, log warning and return empty object to prevent crash
+  console.warn("CleanJson: No braces found in text:", text);
+  return "{}";
 };
 
 const calculateCosineSimilarity = (str1: string, str2: string) => {
+  if (!str1 || !str2) return 0;
   const tokenize = (text: string) => text.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length > 2);
   const words1 = tokenize(str1);
   const words2 = tokenize(str2);
@@ -358,6 +364,9 @@ const RecurLensApp = () => {
   const [recursionHistory, setRecursionHistory] = useState<MetaPromptState[]>([]);
   const [viewMode, setViewMode] = useState<'state' | 'evolution'>('state');
 
+  // Debug State
+  const [showDebug, setShowDebug] = useState(false);
+
   // Clarification State
   const [isWaitingForClarification, setIsWaitingForClarification] = useState(false);
   const [clarificationQuestion, setClarificationQuestion] = useState("");
@@ -391,6 +400,7 @@ const RecurLensApp = () => {
   }, [apiKey]);
 
   const addLog = (type: string, content: any) => {
+    console.log(`[${type}]`, content);
     setLogs(prev => [...prev, { type, content, timestamp: Date.now() }]);
   };
 
@@ -572,15 +582,25 @@ const RecurLensApp = () => {
           config: { responseMimeType: "application/json" }
         });
         
-        const criticText = cleanJson(criticResp.text || "{}");
-        const criticOutput: CriticOutput = JSON.parse(criticText);
+        const rawCritic = criticResp.text || "{}";
+        addLog("debug", `[CRITIC RAW]: ${rawCritic}`);
+        
+        const criticText = cleanJson(rawCritic);
+        let criticOutput: CriticOutput;
+        try {
+            criticOutput = JSON.parse(criticText);
+        } catch(e) {
+            console.error("Critic Parse Error:", e);
+            throw new Error("Meta-Critic returned invalid JSON. Raw output logged.");
+        }
+        
         setCriticState(criticOutput);
         addLog("critic", criticOutput);
 
         // --- INTERRUPTION CHECK: CLARIFICATION ---
-        if (criticOutput.needs_user_clarification) {
+        if (criticOutput?.needs_user_clarification) {
           addLog("system", "⚠️ Ambiguity Detected. Pausing for user clarification.");
-          setClarificationQuestion(criticOutput.clarification_question);
+          setClarificationQuestion(criticOutput.clarification_question || "Please clarify your request.");
           setIsWaitingForClarification(true);
           setCurrentState(currentMeta); 
           setRecursionHistory(localHistory);
@@ -596,8 +616,8 @@ const RecurLensApp = () => {
         }
 
         if (
-          criticOutput.convergence_decision === "STOP" || 
-          criticOutput.weighted_final_score > 0.88 ||
+          criticOutput?.convergence_decision === "STOP" || 
+          (criticOutput?.weighted_final_score && criticOutput.weighted_final_score > 0.88) ||
           (depth > 1 && similarity > 0.98)
         ) {
           addLog("system", "Convergence Threshold Met. Executing...");
@@ -617,13 +637,25 @@ const RecurLensApp = () => {
           config: { responseMimeType: "application/json" }
         });
 
-        currentMeta = JSON.parse(cleanJson(refineResp.text || "{}"));
-        currentMeta.metadata = { iteration: depth, timestamp: new Date().toISOString() };
-        
-        if (!currentMeta.user_sentiment && startState.user_sentiment) {
-          currentMeta.user_sentiment = startState.user_sentiment;
+        const rawRefiner = refineResp.text || "{}";
+        addLog("debug", `[REFINER RAW]: ${rawRefiner}`);
+
+        const refineText = cleanJson(rawRefiner);
+        let nextMeta: MetaPromptState;
+        try {
+            nextMeta = JSON.parse(refineText);
+        } catch (e) {
+             console.error("Refiner Parse Error:", e);
+             throw new Error("Refiner returned invalid JSON. Raw output logged.");
         }
         
+        // Ensure critical fields exist to prevent partial updates
+        nextMeta.metadata = { iteration: depth, timestamp: new Date().toISOString() };
+        if (!nextMeta.user_sentiment && startState.user_sentiment) {
+          nextMeta.user_sentiment = startState.user_sentiment;
+        }
+        
+        currentMeta = nextMeta;
         setCurrentState(currentMeta);
         addLog("refiner", currentMeta);
         
@@ -651,7 +683,7 @@ const RecurLensApp = () => {
       finalMeta.task_type === 'Knowledge' || 
       finalMeta.task_type === 'Planning' || 
       finalMeta.task_type === 'Troubleshooting' ||
-      finalMeta.required_tools.includes('googleSearch');
+      finalMeta.required_tools?.includes('googleSearch');
 
     const executorConfig: any = {
       thinkingConfig: { thinkingBudget: 4096 } // Cognitive Depth
@@ -697,7 +729,7 @@ const RecurLensApp = () => {
         }
       }
 
-      if (finalMeta.risk_analysis.level === "HIGH") {
+      if (finalMeta.risk_analysis?.level === "HIGH") {
         setFinalOutput(prev => `⚠️ SAFETY ADVISORY: ${finalMeta.risk_analysis.mitigation}\n\n` + (prev || ""));
       }
       
@@ -705,7 +737,7 @@ const RecurLensApp = () => {
 
       // --- VISUALIZATION PHASE ---
       // Generate image if appropriate (not for simple Q&A, usually good for most meta-tasks)
-      if (finalMeta.task_type === 'Creative' || finalMeta.task_type === 'Planning' || finalMeta.task_type === 'Troubleshooting' || finalMeta.visual_anchors.length > 0) {
+      if (finalMeta.task_type === 'Creative' || finalMeta.task_type === 'Planning' || finalMeta.task_type === 'Troubleshooting' || (finalMeta.visual_anchors && finalMeta.visual_anchors.length > 0)) {
         setIsVisualizing(true);
         addLog("system", "Generating visual artifact...");
         
@@ -783,7 +815,9 @@ const RecurLensApp = () => {
           },
           config: { responseMimeType: "application/json" }
         });
-        visionData = JSON.parse(cleanJson(visionResp.text || "{}"));
+        const rawVision = visionResp.text || "{}";
+        addLog("debug", `[VISION RAW]: ${rawVision}`);
+        visionData = JSON.parse(cleanJson(rawVision));
         addLog("vision", visionData);
       }
       visionDataRef.current = visionData;
@@ -798,7 +832,10 @@ const RecurLensApp = () => {
         config: { responseMimeType: "application/json" }
       });
       
-      let currentMeta: MetaPromptState = JSON.parse(cleanJson(initResp.text || "{}"));
+      const rawInit = initResp.text || "{}";
+      addLog("debug", `[INIT RAW]: ${rawInit}`);
+
+      let currentMeta: MetaPromptState = JSON.parse(cleanJson(rawInit));
       currentMeta.metadata = { iteration: 0, timestamp: new Date().toISOString() };
       setCurrentState(currentMeta);
       addLog("meta-prompt", currentMeta);
@@ -838,16 +875,18 @@ const RecurLensApp = () => {
 
   // --- RENDER HELPERS ---
 
-  const renderCriticScore = (scores: CriticOutput['scores']) => {
+  const renderCriticScore = (scores: CriticOutput['scores'] | undefined) => {
+    if (!scores) return <div className="text-[10px] text-gray-500 italic">Score unavailable</div>;
+    
     const format = (n: number) => (n * 10).toFixed(1);
     const scoreColor = (n: number) => n > 0.8 ? "text-emerald-400" : n > 0.5 ? "text-amber-400" : "text-rose-400";
     
     return (
       <div className="grid grid-cols-4 gap-2 text-[10px] mt-2 font-mono">
-        <div className="bg-white/5 p-1 rounded text-center border border-white/5"><span className="text-gray-500 block text-[9px] uppercase tracking-wider">Clarity</span><span className={scoreColor(scores.clarity)}>{format(scores.clarity)}</span></div>
-        <div className="bg-white/5 p-1 rounded text-center border border-white/5"><span className="text-gray-500 block text-[9px] uppercase tracking-wider">Complete</span><span className={scoreColor(scores.completeness)}>{format(scores.completeness)}</span></div>
-        <div className="bg-white/5 p-1 rounded text-center border border-white/5"><span className="text-gray-500 block text-[9px] uppercase tracking-wider">Ground</span><span className={scoreColor(scores.grounding)}>{format(scores.grounding)}</span></div>
-        <div className="bg-white/5 p-1 rounded text-center border border-white/5"><span className="text-gray-500 block text-[9px] uppercase tracking-wider">Safety</span><span className={scoreColor(scores.safety)}>{format(scores.safety)}</span></div>
+        <div className="bg-white/5 p-1 rounded text-center border border-white/5"><span className="text-gray-500 block text-[9px] uppercase tracking-wider">Clarity</span><span className={scoreColor(scores.clarity || 0)}>{format(scores.clarity || 0)}</span></div>
+        <div className="bg-white/5 p-1 rounded text-center border border-white/5"><span className="text-gray-500 block text-[9px] uppercase tracking-wider">Complete</span><span className={scoreColor(scores.completeness || 0)}>{format(scores.completeness || 0)}</span></div>
+        <div className="bg-white/5 p-1 rounded text-center border border-white/5"><span className="text-gray-500 block text-[9px] uppercase tracking-wider">Ground</span><span className={scoreColor(scores.grounding || 0)}>{format(scores.grounding || 0)}</span></div>
+        <div className="bg-white/5 p-1 rounded text-center border border-white/5"><span className="text-gray-500 block text-[9px] uppercase tracking-wider">Safety</span><span className={scoreColor(scores.safety || 0)}>{format(scores.safety || 0)}</span></div>
       </div>
     );
   };
@@ -948,6 +987,7 @@ const RecurLensApp = () => {
                   {isWaitingForClarification ? 'AWAITING USER' : isVisualizing ? 'VISUALIZING' : isThinking ? 'DEEP THINKING' : isProcessing ? 'PROCESSING' : 'IDLE'}
                 </span>
              </div>
+             <button onClick={() => setShowDebug(!showDebug)} className={`p-2 transition-colors ${showDebug ? 'text-amber-400' : 'text-gray-400 hover:text-white'}`} title="Toggle Debugger"><Bug className="w-5 h-5" /></button>
              <button onClick={() => setShowCode(true)} className="p-2 text-gray-400 hover:text-white transition-colors" title="Export Code"><FileJson className="w-5 h-5" /></button>
              <button onClick={resetSystem} className="p-2 text-gray-400 hover:text-red-400 transition-colors" title="Reset"><Trash2 className="w-5 h-5" /></button>
           </div>
@@ -1086,13 +1126,17 @@ const RecurLensApp = () => {
                   </div>
                 )}
                 
-                {logs.map((log, idx) => (
+                {logs.map((log, idx) => {
+                  if (log.type === 'debug' && !showDebug) return null;
+
+                  return (
                   <div key={idx} className={`animate-slide-up relative pl-4 border-l-2 ${
                     log.type === 'system' ? 'border-gray-700' :
                     log.type === 'vision' ? 'border-indigo-500' :
                     log.type === 'critic' ? 'border-rose-500' :
                     log.type === 'refiner' ? 'border-purple-500' :
                     log.type === 'success' ? 'border-emerald-500' :
+                    log.type === 'debug' ? 'border-amber-500/50' :
                     'border-gray-500'
                   }`}>
                     {/* Timestamp Dot */}
@@ -1102,6 +1146,7 @@ const RecurLensApp = () => {
                        log.type === 'critic' ? 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.5)]' :
                        log.type === 'refiner' ? 'bg-purple-500 shadow-[0_0_8px_rgba(168,85,247,0.5)]' :
                        log.type === 'success' ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]' :
+                       log.type === 'debug' ? 'bg-amber-500' :
                        'bg-gray-500'
                     }`}></div>
 
@@ -1111,41 +1156,46 @@ const RecurLensApp = () => {
                         log.type === 'critic' ? 'text-rose-400' :
                         log.type === 'refiner' ? 'text-purple-400' :
                         log.type === 'success' ? 'text-emerald-400' :
+                        log.type === 'debug' ? 'text-amber-400' :
                         'text-gray-500'
                       }`}>{log.type}</span>
                       <span className="text-[9px] font-mono text-gray-600">{new Date(log.timestamp).toLocaleTimeString([], {minute:'2-digit', second:'2-digit'})}</span>
                     </div>
 
                     <div className="text-xs text-gray-300 font-mono leading-relaxed">
-                       {log.type === 'system' || log.type === 'error' || log.type === 'success' ? (
+                       {log.type === 'debug' ? (
+                          <div className="bg-amber-950/20 p-2 rounded border border-amber-500/10 text-[10px] text-amber-200/70 overflow-x-auto whitespace-pre-wrap font-mono">
+                             {log.content}
+                          </div>
+                       ) : log.type === 'system' || log.type === 'error' || log.type === 'success' ? (
                           <p>{log.content}</p>
                        ) : log.type === 'vision' ? (
                           <div className="bg-indigo-950/20 p-2 rounded border border-indigo-500/10">
-                            <div className="text-indigo-200 mb-1">"{log.content.scene_summary}"</div>
-                            <div className="text-[10px] text-indigo-400/70">Objects: {log.content.objects.join(", ")}</div>
+                            <div className="text-indigo-200 mb-1">"{log.content?.scene_summary || 'No summary'}"</div>
+                            <div className="text-[10px] text-indigo-400/70">Objects: {log.content?.objects?.join(", ") || 'None'}</div>
                           </div>
                        ) : log.type === 'critic' ? (
                           <div className="bg-rose-950/20 p-2 rounded border border-rose-500/10">
-                            <div className="text-rose-200 italic mb-2">"{log.content.critique_text}"</div>
-                            {renderCriticScore(log.content.scores)}
-                            {log.content.needs_user_clarification && (
+                            <div className="text-rose-200 italic mb-2">"{log.content?.critique_text || 'No critique text'}"</div>
+                            {renderCriticScore(log.content?.scores)}
+                            {log.content?.needs_user_clarification && (
                                <div className="mt-2 text-[10px] bg-rose-500/20 text-rose-300 inline-block px-2 py-0.5 rounded border border-rose-500/30">Clarification Needed</div>
                             )}
                           </div>
                        ) : (
                           <div className="bg-purple-950/20 p-2 rounded border border-purple-500/10 group relative">
                              <div className="text-purple-200 line-clamp-3 group-hover:line-clamp-none transition-all cursor-default">
-                               {log.content.draft_prompt}
+                               {log.content?.draft_prompt || 'No draft generated'}
                              </div>
                              <div className="mt-2 flex gap-2">
-                               <span className="text-[9px] bg-purple-500/20 text-purple-300 px-1.5 py-0.5 rounded">Risk: {log.content.risk_analysis.level}</span>
-                               {log.content.user_sentiment && <span className="text-[9px] bg-blue-500/20 text-blue-300 px-1.5 py-0.5 rounded">Tone: {log.content.user_sentiment.tone}</span>}
+                               <span className="text-[9px] bg-purple-500/20 text-purple-300 px-1.5 py-0.5 rounded">Risk: {log.content?.risk_analysis?.level || 'UNKNOWN'}</span>
+                               {log.content?.user_sentiment && <span className="text-[9px] bg-blue-500/20 text-blue-300 px-1.5 py-0.5 rounded">Tone: {log.content.user_sentiment.tone}</span>}
                              </div>
                           </div>
                        )}
                     </div>
                   </div>
-                ))}
+                )})}
                 <div ref={logsEndRef} />
              </div>
           </div>
@@ -1165,7 +1215,7 @@ const RecurLensApp = () => {
                    {finalOutput && (
                      <>
                         <button onClick={downloadResult} className="p-1.5 hover:bg-white/10 rounded-md transition-colors text-gray-400 hover:text-white"><FileText className="w-4 h-4" /></button>
-                        <button onClick={() => playTTS(finalOutput)} disabled={isSpeaking} className={`p-1.5 hover:bg-white/10 rounded-md transition-colors ${isSpeaking ? 'text-green-400' : 'text-gray-400 hover:text-white'}`}><Volume2 className="w-4 h-4" /></button>
+                        <button onClick={() => playTTS(finalOutput || '')} disabled={isSpeaking} className={`p-1.5 hover:bg-white/10 rounded-md transition-colors ${isSpeaking ? 'text-green-400' : 'text-gray-400 hover:text-white'}`}><Volume2 className="w-4 h-4" /></button>
                      </>
                    )}
                 </div>
